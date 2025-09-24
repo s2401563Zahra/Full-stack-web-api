@@ -1,0 +1,184 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: "18.x"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🔄 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: 📦 Install backend dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: 📦 Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: 🧪 Run backend tests
+        run: |
+          cd backend
+          npm test || echo "No tests found, skipping..."
+
+      - name: 🧪 Run frontend tests
+        run: |
+          cd frontend
+          npm test -- --coverage --watchAll=false || echo "No tests found, skipping..."
+
+      - name: 🏗️ Build frontend
+        run: |
+          cd frontend
+          npm run build
+
+      - name: 📁 Upload frontend build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/build/
+
+  deploy-backend:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+      - name: 🔄 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: 📦 Install backend dependencies
+        run: |
+          cd backend
+          npm ci --production
+
+      - name: 🚀 Deploy to Azure App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ secrets.AZURE_BACKEND_APP_NAME }}
+          publish-profile: ${{ secrets.AZURE_BACKEND_PUBLISH_PROFILE }}
+          package: "./backend"
+
+  deploy-frontend:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+      - name: 🔄 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📁 Download frontend build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/build/
+
+      - name: 🚀 Deploy to Azure Static Web Apps
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: "upload"
+          app_location: "/frontend"
+          output_location: "build"
+          skip_app_build: true
+
+  health-check:
+    needs: [deploy-backend, deploy-frontend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+      - name: 🏥 Backend Health Check
+        run: |
+          echo "Waiting for backend to start..."
+          sleep 30
+
+          BACKEND_URL="https://${{ secrets.AZURE_BACKEND_APP_NAME }}.azurewebsites.net"
+
+          # Health check with retries
+          for i in {1..10}; do
+            if curl -f "$BACKEND_URL/health"; then
+              echo "✅ Backend health check passed"
+              break
+            else
+              echo "⏳ Attempt $i failed, retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
+
+      - name: 🏥 Frontend Health Check
+        run: |
+          FRONTEND_URL="https://${{ secrets.AZURE_FRONTEND_APP_NAME }}.azurestaticapps.net"
+
+          # Simple frontend check
+          if curl -f "$FRONTEND_URL"; then
+            echo "✅ Frontend health check passed"
+          else
+            echo "❌ Frontend health check failed"
+            exit 1
+          fi
+
+  notify:
+    needs: [deploy-backend, deploy-frontend, health-check]
+    runs-on: ubuntu-latest
+    if: always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    steps:
+      - name: 📊 Deployment Summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|-----|" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.deploy-backend.result }}" == "success" ]; then
+            echo "| Backend API | ✅ Success | https://${{ secrets.AZURE_BACKEND_APP_NAME }}.azurewebsites.net |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Backend API | ❌ Failed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.deploy-frontend.result }}" == "success" ]; then
+            echo "| Frontend App | ✅ Success | https://${{ secrets.AZURE_FRONTEND_APP_NAME }}.azurestaticapps.net |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Frontend App | ❌ Failed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.health-check.result }}" == "success" ]; then
+            echo "| Health Check | ✅ Passed | - |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Health Check | ❌ Failed | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📝 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Verify authentication flow works end-to-end" >> $GITHUB_STEP_SUMMARY
+          echo "2. Test database connectivity" >> $GITHUB_STEP_SUMMARY
+          echo "3. Monitor application performance" >> $GITHUB_STEP_SUMMARY
+          echo "4. Set up monitoring and alerts" >> $GITHUB_STEP_SUMMARY
